@@ -245,7 +245,11 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    if model.hybrid_tree == False:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    else:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.static_tree_prefill(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
@@ -451,9 +455,15 @@ def update_inference_inputs(
         token = torch.argmax(prob)
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+
+    if model.hybrid_tree == False:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
+                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                                head=model.base_model.lm_head,logits_processor=logits_processor)
+    else:
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.static_tree_prefill(accept_hidden_state_new,
+                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                                head=model.base_model.lm_head,logits_processor=logits_processor)
 
 
     new_token += accept_length + 1
@@ -461,9 +471,120 @@ def update_inference_inputs(
     return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
 
 
+def construct_choice_from_sequoia_json(
+    tree_filename: str = "/home/mlsys/project/EAGLE/eagle/data/sequoia_trees/10_6_Llama-3.1-8B-Instruct_CodeDrafter-500Mtree.json"
+) -> List[List[int]]:
+    import json
+    """
+    Construct a choice tree from a JSON file.
+    Args:
+        tree_filename (str): Path to the JSON file containing the choice tree.
+    Returns:
+        List[List[int]]: A list of lists representing the choice tree.
+    """
+    with open(tree_filename, "r") as f:
+        if tree_filename.endswith(".json"):
+            tree = json.load(f)
+    successors = tree["Successors"]
+    depth = tree["depth"]
+    idx_in_layer_list = []
+    nodes_in_layers = tree["roots"]
+    for nodes_in_layer in nodes_in_layers:
+        for idx_in_layer, node_idx in enumerate(nodes_in_layer):
+            idx_in_layer_list.append(idx_in_layer)
+    n_nodes = tree["size"]
+    choice_tree = [[0]]
+    for i in range(n_nodes):
+        for successor in successors[i]:
+            # print(i, successor, choice_tree[i])
+            choice_tree.append(
+                choice_tree[i].copy()+ [idx_in_layer_list[successor]])
+    return choice_tree 
+
+
 if __name__ == "__main__":
-    logits = torch.randn(1, 5)
-    tp = prepare_logits_processor(0.9, 0, 0.9, 0)
-    l = tp(None, logits)
-    if tp is None:
-        print(tp)
+    # logits = torch.randn(1, 5)
+    print(construct_choice_from_sequoia_json("/home/mlsys/project/EAGLE/eagle/data/sequoia_trees/10_6_Llama-3.1-8B-Instruct_CodeDrafter-500Mtree.json"))
+    # tp = prepare_logits_processor(0.9, 0, 0.9, 0)
+    # l = tp(None, logits)
+    # if tp is None:
+    #     print(tp)
+
+    """ 1. Test tree buffer generation """
+    """ 1.1 get tree buffer """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    # Test tree_mask generation
+    mc_sim_7b_63 = [[0],[1],[2],[3],[0,0],[0,1],[0,2],[1,0],[1,1],[2,0],[2,1],[3,0]
+                ,[0,0,0],[0,0,1],[0,0,2],[0,1,0],[0,1,1],[0,2,0],[0,2,1],[1,0,0],
+                [0,0,0,0],[0,0,0,1],[0,0,0,2],[0,0,0,0,0],[0,0,0,0,1]]
+
+
+    # test on cpu
+    tree_buffers = generate_tree_buffers(mc_sim_7b_63, device="cpu")
+
+    # tree_attn_mask was [1,1,N,N]，here we retrive [N,N]
+    mask = tree_buffers["tree_attn_mask"][0, 0]
+    print(mask)
+
+    # 用 tree_indices and tree_position_ids to get labels for each tree node
+    indices = tree_buffers["tree_indices"].cpu().numpy()          # shape = (N,)
+    positions = tree_buffers["tree_position_ids"].cpu().numpy()   # shape = (N,)
+    labels = [f"{idx:d} (d{pos})" for idx, pos in zip(indices, positions)]
+    print(indices)
+    print("--------------------")
+    print(positions)
+
+    N = mask.shape[0]
+    fig, ax = plt.subplots(figsize=(8,8), facecolor='white')
+
+    # 1. draw grids
+    for i in range(N+1):
+        ax.axhline(i, color='black', linewidth=1)
+        ax.axvline(i, color='black', linewidth=1)
+
+    # 2. draw mask marks
+    for i in range(N):
+        for j in range(N):
+            if mask[i,j] == 1:
+                ax.text(j+0.5, i+0.5, "✔",
+                        color='red', fontsize=14,
+                        ha='center', va='center')
+
+    # 3. title and labels
+    ax.set_title("Attention mask", fontsize=18, pad=20)
+
+    # 4. set ticks
+    ax.set_xticks(np.arange(N) + 0.5)
+    ax.set_xticklabels(labels, rotation=30, fontsize=10)
+    ax.set_yticks(np.arange(N) + 0.5)
+    ax.set_yticklabels(labels, fontsize=10)
+
+    # 5. set limits and aspect ratio
+    ax.set_xlim(0, N)
+    ax.set_ylim(N, 0)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    plt.savefig("mc_sim_7b_63_tree_mask.png", dpi=300)
+
+    """ 1.2 Validate tree mask """
+    # 1) sort the tree choice
+    sorted_paths = sorted(mc_sim_7b_63, key=lambda x:(len(x), x))
+
+    # 2) get rid of batch dim
+    mask = tree_buffers["tree_attn_mask"][0,0].cpu().numpy()
+    N = mask.shape[0]
+
+    # path_labels: turn [0,1,2] -> "0-1-2"
+    path_labels = ["root"] + ["-".join(map(str,p)) for p in sorted_paths]
+
+    for i in range(N):
+        # find visible nodes for node i 
+        visible_idxs = [j for j in range(N) if mask[i,j]==1]
+        print(f"Query {i} ({path_labels[i]}):")
+        for j in visible_idxs:
+            print(f"    can see  {j} ({path_labels[j]})")
+        print()
+    
+    

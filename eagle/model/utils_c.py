@@ -97,7 +97,7 @@ class Tree:
 
 
 
-def generate_tree_buffers(tree_choices, device="cuda"):
+def generate_tree_buffers_v2(tree_choices, device="cuda"):
     tree=Tree(tree_choices)
     sorted_tree_choices = sorted(tree_choices, key=lambda x: (len(x), x))
     tree_len = tree.num_node_wchild()
@@ -202,5 +202,5 @@ def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.T
 
 if __name__=="__main__":
     from choices import mc_sim_7b_63
-    a=generate_tree_buffers(mc_sim_7b_63)
+    a=generate_tree_buffers_v2(mc_sim_7b_63,device="cpu")
     print(a)

@@ -34,7 +34,9 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            hybrid_tree=False,
+            mtok = None,
     ):
 
         super().__init__()
@@ -51,7 +53,11 @@ class EaModel(nn.Module):
             bias=con["bias"]
         except:
             bias=True
-        self.ea_layer = Model(config,bias=bias,total_tokens=total_token,depth=depth,top_k=top_k,threshold=threshold)
+        
+        self.hybrid_tree=hybrid_tree # true for sequoia tree expansion, false for Eagle-2 tree expansion
+        self.mtok = mtok# The number of top-k candidates to re-rank for Sequoia-Eagle tree
+        
+        self.ea_layer = Model(config,bias=bias,total_tokens=total_token,depth=depth,top_k=top_k,threshold=threshold, hybrid_tree=hybrid_tree)
 
         low_memory=False
 
@@ -87,6 +93,8 @@ class EaModel(nn.Module):
             depth=5,
             top_k=10,
             threshold=1.0,
+            hybrid_tree=False,
+            mtok=8,
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
@@ -128,7 +136,9 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            hybrid_tree=hybrid_tree,
+            mtok=mtok
         )
 
 

@@ -266,6 +266,20 @@ parser.add_argument(
     default=512,
     help="The maximum number of new generated tokens.",
 )
+
+parser.add_argument(
+    "--hybrid-tree",
+    action="store_true",
+    help="Use Sequoia tree as static tree with Dynamic Re-Rank for EAGLE-2",
+)  # true for Sequoia tree, false for eagle-2 tree
+
+parser.add_argument(
+    "--mtok",
+    type=int,
+    default=8,
+    help="The number of top-k candidates to re-rank.",
+)
+
 args = parser.parse_args()
 
 model = EaModel.from_pretrained(
@@ -277,6 +291,8 @@ model = EaModel.from_pretrained(
     load_in_4bit=args.load_in_4bit,
     load_in_8bit=args.load_in_8bit,
     device_map="auto",
+    hybrid_tree=args.hybrid_tree,
+    mtok=args.mtok,
 )
 model.eval()
 warmup(model)

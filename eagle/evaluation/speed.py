@@ -2,7 +2,7 @@ import json
 from transformers import AutoTokenizer
 import numpy as np
 
-tokenizer=AutoTokenizer.from_pretrained("/home/lyh/weights/hf/llama2chat/13B/")
+tokenizer=AutoTokenizer.from_pretrained("/home/mlsys/project/weights/Meta-Llama-3-8B-Instruct")
 jsonl_file = "llama-2-chat-70b-fp16-ea-in-temperature-0.0.jsonl"
 jsonl_file_base = "llama-2-chat-70b-fp16-base-in-temperature-0.0.jsonl"
 data = []
