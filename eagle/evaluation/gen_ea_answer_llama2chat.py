@@ -402,7 +402,7 @@ if __name__ == "__main__":
             suffix = f"-hybrid-mtok{args.mtok}"
         else:
             suffix = "-ea"
-        answer_file = f"{args.bench_name}/{args.model_id}{suffix}.jsonl"
+        answer_file = f"{parent_dir}/{args.bench_name}/{args.model_id}{suffix}.jsonl"
 
     print(f"Output to {answer_file}")
 

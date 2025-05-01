@@ -45,8 +45,8 @@ for datapoint in data:
 
 
 
-# print('speed',np.array(speeds).mean())
-# print('speed0',np.array(speeds0).mean())
+print('speed-ea',np.array(speeds).mean())
+print('speed-base',np.array(speeds0).mean())
 print("ratio",np.array(speeds).mean()/np.array(speeds0).mean())
 
 

@@ -434,7 +434,7 @@ if __name__ == "__main__":
         answer_file = args.answer_file
     else:
         tree_type = "hybrid" if args.hybrid_tree else "ea"
-        answer_file = f"{args.model_id}-{tree_type}-mtok{args.mtok}.jsonl"
+        answer_file = f"{parent_dir}/{args.model_id}-{tree_type}-mtok{args.mtok}.jsonl"
 
     print(f"Output to {answer_file}")
 
