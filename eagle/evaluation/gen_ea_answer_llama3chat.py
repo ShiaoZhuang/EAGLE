@@ -429,10 +429,12 @@ if __name__ == "__main__":
         ray.init()
 
     question_file = f"{parent_dir}/data/{args.bench_name}/question.jsonl"
+    
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        tree_type = "hybrid" if args.hybrid_tree else "ea"
+        answer_file = f"{args.model_id}-{tree_type}-mtok{args.mtok}.jsonl"
 
     print(f"Output to {answer_file}")
 

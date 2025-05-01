@@ -36,7 +36,9 @@ def run_eval(
         num_gpus_total,
         max_gpu_memory,
         temperature,
-        args
+        args,
+        hybrid_tree,   
+        mtok           
 ):
     questions = load_questions(question_file, question_begin, question_end)
     # random shuffle the questions to balance the loading
@@ -71,7 +73,9 @@ def run_eval(
                 num_gpus_per_model,
                 max_gpu_memory,
                 temperature,
-                args
+                args,
+                hybrid_tree,    
+                mtok            
             )
         )
 
@@ -91,7 +95,9 @@ def get_model_answers(
         num_gpus_per_model,
         max_gpu_memory,
         temperature,
-        args
+        args,
+        hybrid_tree,    
+        mtok            
 ):
     # temperature = 0.0
 
@@ -104,7 +110,9 @@ def get_model_answers(
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         # load_in_8bit=True,
-        device_map="auto"
+        device_map="auto",
+        hybrid_tree=hybrid_tree,   
+        mtok=mtok                  
     )
 
     tokenizer = model.get_tokenizer()
@@ -294,7 +302,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--load-in-8bit", action="store_false", help="Use 8-bit quantization"
     )
-    parser.add_argument("--model-id", type=str, default="ess-llama-2-chat-70b-fp16")
+    parser.add_argument("--model-id", type=str, default="llama-2-chat-13b-fp16")
     parser.add_argument(
         "--bench-name",
         type=str,
@@ -365,6 +373,19 @@ if __name__ == "__main__":
         default="mc_sim_7b_63",
     )
 
+    parser.add_argument(
+        "--hybrid-tree",
+        action="store_true",
+        help="Use Sequoia tree as static tree with Dynamic Re-Rank for EAGLE-2",
+    )  # true for Sequoia tree, false for eagle-2 tree
+
+    parser.add_argument(
+        "--mtok",
+        type=int,
+        default=8,
+        help="The number of top-k candidates to re-rank.",
+    )
+
     args = parser.parse_args()
 
     args.model_id = args.model_id + "-temperature-" + str(args.temperature)
@@ -377,7 +398,11 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"{args.bench_name}/{args.model_id}.jsonl"
+        if args.hybrid_tree:
+            suffix = f"-hybrid-mtok{args.mtok}"
+        else:
+            suffix = "-ea"
+        answer_file = f"{args.bench_name}/{args.model_id}{suffix}.jsonl"
 
     print(f"Output to {answer_file}")
 
@@ -395,7 +420,9 @@ if __name__ == "__main__":
         args.num_gpus_total,
         args.max_gpu_memory,
         args.temperature,
-        args
+        args,
+        args.hybrid_tree,   
+        args.mtok           
     )
 
     reorg_answer_file(answer_file)
