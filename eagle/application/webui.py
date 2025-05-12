@@ -11,7 +11,7 @@ except:
 import torch
 from fastchat.model import get_conversation_template
 import re
-
+from eagle.model.utils import profiled_steps
 
 def truncate_list(lst, num):
     if num not in lst:
@@ -179,7 +179,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             new_tokens = cu_len-input_len
             yield history,f"{new_tokens/totaltime:.2f} tokens/s",f"{new_tokens/total_ids:.2f}",session_state
             start_time = time.time()
-
+        print("profiled_steps:", profiled_steps)
 
     else:
         for output_ids in model.naive_generate(input_ids, temperature=temperature, top_p=top_p,
@@ -204,6 +204,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             new_tokens = cu_len - input_len
             yield history,f"{new_tokens/totaltime:.2f} tokens/s",f"{new_tokens/total_ids:.2f}",session_state
             start_time = time.time()
+        print("profiled_steps:", profiled_steps)
 
 
 def user(user_message, history,session_state):

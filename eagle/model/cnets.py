@@ -32,7 +32,7 @@ from transformers.activations import ACT2FN
 
 try:
     from .configs import EConfig
-    from .utils import prepare_logits_processor, generate_tree_buffers
+    from .utils import prepare_logits_processor, generate_tree_buffers, Timer2
     from .utils_c import *
     from .choices import *
 except:
@@ -520,7 +520,7 @@ class Model(nn.Module):
         self.mtok = mtok
 
     def init_tree(self):
-        self.tree = llama_3_1_8b_instruct_4090
+        self.tree = t_8_10
         if self.hybrid_tree:
             self.static_tree_buffers = generate_tree_buffers(self.tree, device=self.embed_tokens.weight.device)
             self.tree_indices = self.static_tree_buffers["tree_indices"]
@@ -790,6 +790,44 @@ class Model(nn.Module):
 
         # with Timer("post"):
 
+        # # 在全局 top-k rerank 之前，打印每个节点的累积分数
+        # # scores_list 和 ss_token 本身就是一个层级列表
+        # layer_scores = scores_list      # list of Tensor, 每层累积 log-prob
+        # layer_tokens = ss_token         # list of Tensor, 每层对应的 token_id
+
+        # # 统计总节点数
+        # total_nodes = sum(t.numel() for t in layer_scores)
+        # print(f"Tree has {total_nodes} nodes in total (excluding the root node)")
+
+        # # 按照层级累积偏移，构建 node_id -> (score, token_id)
+        # node_scores = {}
+        # offset = 0
+        # for lvl, (scores, tokens) in enumerate(zip(layer_scores, layer_tokens)):
+        #     flat_scores = scores.view(-1)
+        #     flat_tokens = tokens.view(-1)
+        #     for i in range(flat_scores.size(0)):
+        #         node_id = offset + i
+        #         node_scores[node_id] = (flat_scores[i].item(), flat_tokens[i].item())
+        #     offset += flat_scores.size(0)
+
+        # # 打印树结构
+        # print("\nTree structure with scores:")
+        # for node_id, (score, token_id) in sorted(node_scores.items()):
+        #     # 复用你原来的 parent 计算逻辑
+        #     parent_idx = None
+        #     if node_id >= top_k:  # 不是第一层
+        #         parent_offset = 0
+        #         for d in range(depth):
+        #             layer_size = sum(layer_scores[d2].numel() for d2 in range(d+1))
+        #             next_size  = sum(layer_scores[d2].numel() for d2 in range(d+2))
+        #             if node_id < next_size:
+        #                 parent_idx = (node_id - next_size + layer_scores[d+1].numel()) // top_k + parent_offset
+        #                 break
+        #             parent_offset += layer_scores[d+1].numel()
+        #     parent_info = f", parent={parent_idx}" if parent_idx is not None else ""
+        #     print(f"Node {node_id}: token_id={token_id}, score={score:.4f}{parent_info}")
+        # # ...existing code...
+        # with Timer2("rerank"):
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
@@ -1133,131 +1171,129 @@ class Model(nn.Module):
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
     
-    def static_tree_prefill_v1(self, hidden_states, input_ids, head, logits_processor):
+    def static_tree_prefill_without_rerank(self, hidden_states, input_ids, head, logits_processor):
         """
         Prefill the static tree structure for speculative decoding.
+        
+        Args:
+            hidden_states: decoder's current hidden states
+            input_ids: initial input token ids
+            head: classification head (lm_head)
+            logits_processor: processor for sampling
+            
+        Returns:
+            tuple: (draft_tokens, retrieve_indices, tree_mask, tree_position_ids)
         """
-
         device = hidden_states.device
-        TOPK = self.top_k
+        TOPK   = self.top_k
 
-        # Prepare input
-        input_ids = input_ids.to(device)
-        sample_tok = input_ids[:, -1:]  # Last token
-        input_ids = input_ids[:, 1:]
-        len_posi = input_ids.shape[1]
-
+        # Process input prompt
+        input_ids = input_ids.to(hidden_states.device)
+        sample_tok = input_ids[:, -1:]  # Last token of the prompt
+        input_ids = input_ids[:, 1:]  # Remove start token
+        input_ids = input_ids.to(hidden_states.device)
+        len_posi = input_ids.shape[1]  # Current sequence length for positional encoding
+        
         # Reset inference state
         self.reset()
-
-        # Process prompt
+        
+        # Process the prompt and get its hidden states
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:], past_key_values=self.stable_kv, use_cache=True)
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+                                            past_key_values=self.stable_kv, use_cache=True)
         else:
             out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
         
         self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
-        input_hidden = last_hidden.unsqueeze(1)  # (1,1,hidden_dim)
-        input_ids = sample_tok  # (1,1)
-
-        # Buffers
+        last_hidden = out_hidden[:, -1]                    # (batch_size, hidden_dim)
+        # print(f"last_hidden.shape={last_hidden.shape}, out_hidden.shape={out_hidden.shape}")
+        
+        
+        # 3) 拿静态树 buffer
+        # tree_buf        = generate_tree_buffers(mc_sim_7b_63, device=device)
         tree_buf = self.static_tree_buffers
-        tree_mask = tree_buf["tree_attn_mask"]
+        tree_mask       = tree_buf["tree_attn_mask"]     # (1,1,L,L)
+        #tree_pos_ids    = tree_buf["tree_position_ids"]  # (L,)
         tree_pos_ids = self.tree_pos_ids
-        retrieve_inds = tree_buf["retrieve_indices"]
+        retrieve_inds   = tree_buf["retrieve_indices"]   # (leaf_num, max_depth+1)
+        # tree_indices    = tree_buf["tree_indices"]       # (L,)
 
-        # Initialize tracking lists
-        drafted = []
-        parents_list = []
-        scores_list = []
-        ss_list = []
-        parent_scores = [0.0]  # Initial root score
+        # L = tree_indices.size(0) # 总节点数，包括 root 和 leaf
+        # # 4) 计算每个父节点需要生成多少孩子
+        # child_cnt = [0] * L
+        # for cid in range(1, L):
+        #     p = (tree_indices[cid].item() - 1) // TOPK
+        #     child_cnt[p] += 1
 
-        # Initialize root node
-        current_nodes = [0]  # Root node id = 0
+        # # 5) 按 depth 收集节点索引
+        # depth_map = {}
+        # for idx, d in enumerate(tree_pos_ids.tolist()):
+        #     depth_map.setdefault(d, []).append(idx)
 
-        leaf_nodes = []
+        # 6) BFS 分层并行采样
+        drafted = []            # 所有子 token id
 
-        while current_nodes:
-            #position_ids = len_posi+self.position_ids
-            # Forward
-            out_hidden, past_key_values = self(
+        # 初始 layer depth=0，只有 root→children
+        input_hidden = last_hidden.unsqueeze(1)   # (1,1,hidden_dim)
+        input_ids    = sample_tok                  # (1,1)
+
+        #print(f'child_cnt={self.child_cnt}')
+
+        for depth in sorted(self.depth_map.keys()):
+            parents = self.depth_map[depth]
+            if not parents or all(self.child_cnt[p]==0 for p in parents):
+                continue
+            # print("parents", parents)
+            # 一次 forward 拿到每个 parent→hidden, logits
+            out_h, past_kv = self(
                 input_hidden,
                 input_ids=input_ids,
-                #position_ids=position_ids,
                 past_key_values=past_key_values,
+                # position_ids=position_ids,
                 use_cache=True,
             )
             len_posi += 1
 
-            last_h = out_hidden[0]  # (n_parents, hidden_dim)
-            logits = head(last_h)  # (n_parents, vocab)
-            scores = self.logsoftmax(logits)
+            last_h = out_h[0]                    # (n_parents, hidden_dim)
+            logits = head(last_h)                # (n_parents, vocab)
+            scores = self.logsoftmax(logits)     # (n_parents, vocab)
             if logits_processor is not None:
                 scores = logits_processor(input_ids, scores)
 
+            # 准备下一层的 batch
             next_h_list = []
             next_id_list = []
-            new_current_nodes = []
-
-            for i, pidx in enumerate(current_nodes):
-                k = self.child_cnt[pidx]
-                print(f'pidx={pidx}, k={k}')
+            for i, pidx in enumerate(parents):
+                k = self.child_cnt[pidx]  # 该父节点的固定分支数
                 if k <= 0:
-                    leaf_nodes.append(pidx)
                     continue
-
                 topk = torch.topk(scores[i], k, dim=-1)
-                toks = topk.indices  # (k,)
-                toks_scores = topk.values  # (k,)
+                toks = topk.indices     # (k,)
+                toks_scores = topk.values # (k,)
+                drafted.extend(toks.tolist()) #逐层加入整个静态树所有draft出来的token id list
 
-                # Record results
-                drafted.extend(toks.tolist())
-                ss_list.extend(toks.tolist())
-                parents_list.extend([pidx] * k)
-
-                parent_score = parent_scores[i]
-                scores_list.extend((parent_score + toks_scores).tolist())
-
-                # Update parent_scores for next layer
-                for s in (parent_score + toks_scores).tolist():
-                    parent_scores.append(s)
-
-                # Prepare next input_hidden and input_ids
-                parent_h = last_h[i]
-                next_h_list.extend([parent_h] * k)
-                next_id_list.extend(toks.tolist())
-
-                # Update new current_nodes
-                new_current_nodes.extend(range(len(parents_list) - len(toks)+1, len(parents_list)+1))
-                print(f'new_current_nodes={new_current_nodes}')
+                # 父 hidden 直接复用，复制 k 次
+                parent_h = last_h[i]    # (hidden_dim,)，第i个父节点的 hidden
+                next_h_list.extend([parent_h] * k) # (k, hidden_dim)，每个父节点的 hidden 复制 k 次
+                next_id_list.extend(toks.tolist()) # (k,)，把这个parent的k个子节点的 token id 加入到下层的输入中
 
             if not next_id_list:
                 break
 
-            input_hidden = torch.stack(next_h_list, dim=0).unsqueeze(0)  # (1, total_branch, hidden_dim)
-            input_ids = torch.tensor(next_id_list, device=device).unsqueeze(0)  # (1, total_branch)
+            # next_h_list是这一层的所有父节点生成的子节点的hidden，存储父节点hidden是因为现在还没法得到下一层节点的hidden
+            # next_id_list是这一层节点的所有子节点的token id
+            # 长度为当前这一层所有 parent 节点各自生成的所有子节点数量的总和
 
-            current_nodes = new_current_nodes
+            # 构造下层并行输入
+            input_hidden = torch.stack(next_h_list, dim=0).unsqueeze(0)     # (bs=1,total_branch,hidden_dim)
+            input_ids    = torch.tensor(next_id_list, device=device).unsqueeze(0)  # (bs=1,total_branch)
 
-        # Draft tokens = [root token] + [all drafted tokens]
+        # 7) 拼接 draft_tokens：root token + 所有分支 token （sampling结果）
         draft_tokens = torch.cat([
             sample_tok,
             torch.tensor(drafted, device=device).unsqueeze(0)
-        ], dim=1)
-
-        # Debug print
-        print(f'draft_tokens.shape={draft_tokens.shape}')
-        print(f'ss_list={ss_list}')
-        print(f'parents_list={parents_list}')
-        print(f'scores_list={scores_list}')
-        print(f'parent_scores={parent_scores}')
-        print(f'child_cnt={self.child_cnt}')
-        
-        print(f'tree_pos_ids={tree_pos_ids}')
-        print(f'leaf_nodes={leaf_nodes}')
+        ], dim=1)  # (1, 1+total_tokens)
 
         return draft_tokens, retrieve_inds, tree_mask, tree_pos_ids
 

@@ -268,6 +268,7 @@ class EaModel(nn.Module):
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
             candidates=draft_tokens[0,retrieve_indices]
+            # with Timer2("evaluate_posterior"):    
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
@@ -455,9 +456,10 @@ class EaModel(nn.Module):
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
             candidates=draft_tokens[0,retrieve_indices]
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
-            )
+            with Timer2("static_tree_prefill"):    
+                best_candidate, accept_length, sample_p = evaluate_posterior(
+                    logits, candidates, logits_processor
+                )
             # print(accept_length)
             #with Timer("update_inference_inputs"):
             input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
@@ -570,3 +572,122 @@ class EaModel(nn.Module):
 
 
 
+    @torch.no_grad()
+    def eaself_generate(
+            self,
+            input_ids,
+            max_new_tokens=12,
+            refresh_every=4,          # ← 新增：刷新步长
+            temperature=0.8,
+            top_p=0.9,
+            top_k=40,
+    ):
+        """
+        只用 ea_layer 解码，但每 refresh_every 步重新调用 base_model
+        以更新 prev_hidden。
+        """
+        stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        # max_length=max_length-self.ea_layer.total_tokens-10
+
+        if temperature > 1e-5:
+            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
+        else:
+            logits_processor = None
+        #assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
+        # Avoid modifying the input_ids in-place
+
+        padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
+        input_ids = input_ids.clone()
+        self.ea_layer.reset_kv()
+
+
+
+        # Initialize the past key and value states
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data
+            current_length_data = self.current_length_data
+            # Reset the past key and value states
+            current_length_data.zero_()
+        else:
+            (
+                past_key_values,
+                past_key_values_data,
+                current_length_data,
+            ) = initialize_past_key_values(self.base_model)
+            self.past_key_values = past_key_values
+            self.past_key_values_data = past_key_values_data
+            self.current_length_data = current_length_data
+
+        input_len = input_ids.shape[1]
+        reset_tree_mode(self)
+        # set up end
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+            input_ids, self, past_key_values, logits_processor
+        )
+
+        
+        return draft_tokens
+
+        device = input_ids.device
+        # logits_proc = prepare_logits_processor(
+        #     temperature=temperature, top_p=top_p, top_k=top_k
+        # )
+        logits_proc = None
+
+        # ① 先跑一次大模型，拿 prompt 的 hidden
+        _, hidden_state = self(
+            input_ids=input_ids,
+            output_orig=False
+        )
+        prev_hidden = hidden_state[:, -1:, :]      # [1,1,H]
+
+        past_kv = None
+        generated = input_ids
+        step = 0                                   # ← 计数器
+
+        for _ in range(max_new_tokens):
+            step += 1
+
+            # ② 只跑 ea_layer 预测下一 token 的 hidden
+            next_hidden, past_kv = self.ea_layer(
+                prev_hidden,
+                input_ids=generated[:, -1:],        # 当前 token
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+
+            logits = self.base_model.lm_head(next_hidden[:, -1:, :])
+            if logits_proc is not None:
+                logits = logits_proc(None, logits)
+
+            probs = torch.softmax(logits, dim=-1)
+            # next_token = torch.multinomial(probs.view(-1), 1).unsqueeze(0)
+            top_k = 5
+            topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)  # [1, 1, 5]
+            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # 归一化
+            # 在 top5 里采样
+            sample = torch.multinomial(topk_probs.view(-1, top_k), 1)  # [batch, 1]
+            next_token = topk_indices.view(-1, top_k).gather(1, sample)  # [batch, 1]
+
+            generated = torch.cat([generated, next_token], dim=-1)
+
+            # ③ 判断是否需要刷新 prev_hidden
+            if step % refresh_every == 0:           # ← 修改处
+                # 只把“最新 1 个 token”喂给大模型即可
+                _, hid = self(
+                    input_ids=generated,   # 也可以传全部 ids，差别很小
+                    output_orig=False
+                )
+                prev_hidden = hid[:, -1:, :]                  # 用“真”隐藏替换
+            else:
+                prev_hidden = next_hidden          # 用 draft 输出滚动
+
+            # 结束条件
+            if next_token.item() in {
+                self.tokenizer.eos_token_id,
+                self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+            }:
+                break
+
+        return generated

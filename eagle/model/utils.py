@@ -10,6 +10,51 @@ import torch
 # from transformers import LlamaTokenizer
 # tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
 
+from collections import defaultdict
+
+global profiled_steps  # list of dicts, each for one step
+profiled_steps = []
+current_step = None
+
+class Timer2:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        torch.cuda.synchronize()
+        self.start = time.perf_counter()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self.start
+        global current_step
+        if self.name == 'static_tree_prefill':
+            
+            current_step = {'step_id': len(profiled_steps) + 1,
+                            'tree_time': elapsed,
+                            'verify_times': []}
+            profiled_steps.append(current_step)
+            # get current avg_tree_time
+            avg_tree_time = sum([step['tree_time'] for step in profiled_steps]) / len(profiled_steps)
+            print(f"Avg tree time: {avg_tree_time:.4f} seconds")
+
+        elif self.name == 'evaluate_posterior':
+            assert current_step is not None
+            current_step['verify_times'].append(elapsed)
+        elif self.name == 'rerank':
+            # global current_step
+            current_step = {'step_id': len(profiled_steps) + 1,
+                            'rerank_time': elapsed,
+                            'verify_times': []}
+            profiled_steps.append(current_step)
+
+            avg_rerank_time = sum([step['rerank_time'] for step in profiled_steps]) / len(profiled_steps)
+            print(f"Avg rerank time: {avg_rerank_time:.4f} seconds")
+
+
+
+
+
 TOPK = 10  # topk for sparse tree
 
 from transformers.generation.logits_process import (
@@ -245,9 +290,12 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
+    #with Timer("static_tree_prefill" if model.hybrid_tree else "topK_generate"):
     if model.hybrid_tree == False:
+        # with Timer2("static_tree_prefill"):
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     else:
+        # with Timer2("static_tree_prefill"):
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.static_tree_prefill(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
     
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
@@ -349,6 +397,7 @@ def evaluate_posterior(
     - best_candidate (torch.Tensor): Index of the chosen best candidate.
     - accept_length (int): Length of the accepted candidate sequence.
     """
+    #with Timer("evaluate_posterior"):
     # Greedy decoding based on temperature value
     if logits_processor is None:
         # Find the tokens that match the maximum logits for each position in the sequence
@@ -456,11 +505,14 @@ def update_inference_inputs(
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
 
+
     if model.hybrid_tree == False:
+        # with Timer2("static_tree_prefill"):
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                                input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                                head=model.base_model.lm_head,logits_processor=logits_processor)
+                                            input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                            head=model.base_model.lm_head,logits_processor=logits_processor)
     else:
+        # with Timer2("static_tree_prefill"):
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.static_tree_prefill(accept_hidden_state_new,
                                                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
                                                 head=model.base_model.lm_head,logits_processor=logits_processor)
@@ -472,7 +524,7 @@ def update_inference_inputs(
 
 
 def construct_choice_from_sequoia_json(
-    tree_filename: str = "/home/mlsys/project/EAGLE/eagle/data/sequoia_trees/10_6_Llama-3.1-8B-Instruct_CodeDrafter-500Mtree.json"
+    tree_filename: str = "/home/mlsys/project/EAGLE/eagle/data/sequoia_trees/8_10_Llama-3.1-8B-Instruct_CodeDrafter-500Mtree.json"
 ) -> List[List[int]]:
     import json
     """
